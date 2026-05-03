@@ -92,16 +92,60 @@ const setStorage = <T,>(key: string, value: T) => {
   localStorage.setItem(key, JSON.stringify(value));
 };
 
-const callGemini = async (prompt: string, modelId: string = "gemini-3-flash-preview", isJson: boolean = true) => {
-  const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-  const response = await ai.models.generateContent({
-    model: modelId,
-    contents: prompt,
-    config: isJson ? { responseMimeType: "application/json" } : {}
-  });
+const callGemini = async (contents: string | any[], modelId: string = "gemini-3-flash-preview", isJson: boolean = true, systemInstruction?: string, responseSchema?: any) => {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    const err = 'GEMINI_API_KEY is missing from environment. Please set it in Settings -> Secrets.';
+    console.error(err);
+    throw new Error(err);
+  }
   
-  const text = response.text || '';
-  return isJson ? JSON.parse(text.replace(/```json/g, '').replace(/```/g, '').trim()) : text;
+  try {
+    const ai = new GoogleGenAI({ apiKey });
+    const response = await ai.models.generateContent({
+      model: modelId,
+      contents: Array.isArray(contents) ? contents : contents,
+      config: {
+        ...(isJson ? { responseMimeType: "application/json" } : {}),
+        ...(responseSchema ? { responseSchema } : {}),
+        ...(systemInstruction ? { systemInstruction } : {})
+      }
+    });
+    
+    const text = response.text || '';
+    if (!text) {
+      throw new Error('Empty response from AI model');
+    }
+    
+    if (isJson) {
+      try {
+        const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
+        return JSON.parse(cleaned);
+      } catch (e) {
+        console.error('Failed to parse AI JSON response:', text);
+        const jsonMatch = text.match(/\[[\s\S]*\]|\{[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            return JSON.parse(jsonMatch[0]);
+          } catch (innerE) {
+            throw new Error('Invalid JSON structure in AI response');
+          }
+        }
+        throw new Error('Could not extract JSON from AI response');
+      }
+    }
+    return text;
+  } catch (error: any) {
+    console.error("Gemini API Error Detail:", error);
+    // Extract a user-friendly message from Google API error
+    let message = error.message || "An unexpected AI error occurred.";
+    if (message.includes("quota") || message.includes("429")) {
+      message = "AI Limit Reached: Please wait a minute before trying again (Google Free Tier Quota).";
+    } else if (message.includes("API key")) {
+      message = "Invalid API Key: Please check your GEMINI_API_KEY in Settings.";
+    }
+    throw new Error(message);
+  }
 };
 
 // --- Components ---
@@ -191,7 +235,14 @@ const AuthView = ({ onLogin }: { onLogin: (user: UserProfile) => void }) => {
 
       onLogin(profile);
     } catch (err: any) {
-      setError(err.message);
+      console.error("Google Login Error:", err);
+      let errorMessage = err.message;
+      if (err.code === 'auth/popup-blocked') {
+        errorMessage = "Sign-in popup was blocked. Please allow popups for this site.";
+      } else if (err.code === 'auth/unauthorized-domain') {
+        errorMessage = "This domain is not authorized for Google Sign-in in the Firebase Console. Please add it to Authorized Domains.";
+      }
+      setError(errorMessage);
     }
   };
 
@@ -475,40 +526,57 @@ const AITutor = ({ user }: { user: UserProfile }) => {
     setIsLoading(true);
 
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
       const history = messages.map(msg => ({
         role: msg.role === 'user' ? 'user' : 'model',
         parts: [{ text: msg.text }]
       }));
       
-      const response = await ai.models.generateContent({
-        model: selectedModel,
-        contents: [...history, { role: 'user', parts: [{ text: textToSend }] }],
-        config: {
-          responseMimeType: "application/json",
-          systemInstruction: `You are an encouraging and knowledgeable AI study tutor for ${user.username}. 
-          The user is focusing on: ${user.academicProfile?.subjects.join(', ') || 'General studies'}.
-          Their study strategy is: ${user.academicProfile?.studyStrategy || 'Standard active learning'}.
-          Help students understand complex concepts, explain topics clearly, and offer study tips tailored to their subjects.
-          
-          INTERACTIVITY REQUIREMENT:
-          You MUST return your response as a strict JSON object with this structure: { "text": "...", "suggestions": [{ "label": "...", "type": "question" | "topic" | "practical" }] }.
-          
-          Suggestions Guidelines:
-          1. "Follow-up Question": A specific question that probes deeper into the current concept.
-          2. "Related Topic": A lateral connection to a sibling concept or advanced prerequisite.
-          3. "Practical Challenge": A quick "test yourself" task or real-world application.
-          
-          Provide 3 distinct, high-quality suggestions. Avoid generic "Tell me more". Make the user curious!`
-        }
-      });
+      const systemInstruction = `You are an encouraging and knowledgeable AI study tutor for ${user.username}. 
+      The user is focusing on: ${user.academicProfile?.subjects.join(', ') || 'General studies'}.
+      Their study strategy is: ${user.academicProfile?.studyStrategy || 'Standard active learning'}.
+      Help students understand complex concepts, explain topics clearly, and offer study tips tailored to their subjects.
+      
+      INTERACTIVITY REQUIREMENT:
+      You MUST return your response as a strict JSON object with this structure: { "text": "...", "suggestions": [{ "label": "...", "type": "question" | "topic" | "practical" }] }.
+      
+      Suggestions Guidelines:
+      1. "Follow-up Question": A specific question that probes deeper into the current concept.
+      2. "Related Topic": A lateral connection to a sibling concept or advanced prerequisite.
+      3. "Practical Challenge": A quick "test yourself" task or real-world application.
+      
+      Provide 3 distinct, high-quality suggestions. Avoid generic "Tell me more". Make the user curious!`;
 
-      const data = JSON.parse(response.text || '{}');
+      const schema = {
+        type: 'object',
+        properties: {
+          text: { type: 'string' },
+          suggestions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                label: { type: 'string' },
+                type: { type: 'string', enum: ['question', 'topic', 'practical'] }
+              },
+              required: ['label', 'type']
+            }
+          }
+        },
+        required: ['text', 'suggestions']
+      };
+
+      const data = await callGemini(
+        [...history, { role: 'user', parts: [{ text: textToSend }] }], 
+        selectedModel, 
+        true, 
+        systemInstruction,
+        schema
+      );
+
       const botMessage: Message = { 
         role: 'bot', 
-        text: data.text, 
-        suggestions: data.suggestions,
+        text: data.text || "I processed your request, but couldn't generate a clear explanation. Let's try rephrasing!", 
+        suggestions: data.suggestions || [],
         timestamp: new Date() 
       };
       setMessages(prev => [...prev, botMessage]);
@@ -640,6 +708,12 @@ const AITutor = ({ user }: { user: UserProfile }) => {
   );
 };
 
+interface SessionHistoryEntry {
+  type: 'work' | 'break';
+  duration: number;
+  timestamp: number;
+}
+
 const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: number) => void }) => {
   const [settings, setSettings] = useState<TimerSettings>({
     work: 25,
@@ -653,6 +727,11 @@ const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: numbe
   const [workSound, setWorkSound] = useState(localStorage.getItem('studybuddy_work_sound') || "https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3");
   const [breakSound, setBreakSound] = useState(localStorage.getItem('studybuddy_break_sound') || "https://assets.mixkit.co/active_storage/sfx/598/598-preview.mp3");
   const [showSoundSettings, setShowSoundSettings] = useState(false);
+  const [sessionHistory, setSessionHistory] = useState<SessionHistoryEntry[]>(() => {
+    const saved = localStorage.getItem('studybuddy_session_history');
+    return saved ? JSON.parse(saved) : [];
+  });
+  const [showHistory, setShowHistory] = useState(false);
   const timerRef = useRef<NodeJS.Timeout | null>(null);
 
   const soundPresets = {
@@ -718,10 +797,22 @@ const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: numbe
     };
   }, [isActive, timeLeft]);
 
+  useEffect(() => {
+    localStorage.setItem('studybuddy_session_history', JSON.stringify(sessionHistory));
+  }, [sessionHistory]);
+
   const handleTimerComplete = () => {
     setIsActive(false);
     if (timerRef.current) clearInterval(timerRef.current);
     
+    // Add to history
+    const historyEntry: SessionHistoryEntry = {
+      type: mode === 'work' ? 'work' : 'break',
+      duration: settings[mode] * 60,
+      timestamp: Date.now()
+    };
+    setSessionHistory(prev => [historyEntry, ...prev].slice(0, 50)); // Keep last 50 entries
+
     if (mode === 'work') {
       const newCount = sessionsCompleted + 1;
       setSessionsCompleted(newCount);
@@ -871,6 +962,50 @@ const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: numbe
         >
           <Settings className="w-3 h-3" /> Audio Settings
         </button>
+
+        <button
+          onClick={() => setShowHistory(!showHistory)}
+          className="text-[10px] font-bold text-[#8C8C73] uppercase tracking-widest hover:text-[#5A5A40] transition-colors flex items-center gap-2"
+        >
+          <History className="w-3 h-3" /> Session History
+        </button>
+
+        {showHistory && (
+          <motion.div 
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
+            className="w-full mt-6 p-6 bg-[#F5F5F0] rounded-[24px] border border-[#D9D9C3] space-y-4 max-h-64 overflow-y-auto scrollbar-hide"
+          >
+            <div className="flex justify-between items-center mb-2">
+              <h4 className="text-[10px] font-black text-[#5A5A40] uppercase tracking-widest">Recent Logs</h4>
+              <button 
+                onClick={() => setSessionHistory([])}
+                className="text-[8px] font-bold text-red-500 uppercase tracking-widest hover:text-red-600"
+              >
+                Clear History
+              </button>
+            </div>
+
+            {sessionHistory.length === 0 ? (
+              <p className="text-[10px] text-[#8C8C73] italic text-center py-4">No sessions documented yet.</p>
+            ) : (
+              <div className="space-y-3">
+                {sessionHistory.map((entry, idx) => (
+                  <div key={idx} className="flex justify-between items-center bg-white p-3 rounded-xl border border-[#D9D9C3]/50">
+                    <div className="flex items-center gap-3">
+                      <div className={`w-2 h-2 rounded-full ${entry.type === 'work' ? 'bg-[#5A5A40]' : 'bg-[#BC6C25]'}`} />
+                      <div>
+                        <p className="text-[10px] font-black text-[#5A5A40] uppercase">{entry.type === 'work' ? 'Deep focus' : 'Cognitive Break'}</p>
+                        <p className="text-[8px] text-[#8C8C73] uppercase tracking-tight">{new Date(entry.timestamp).toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' })}</p>
+                      </div>
+                    </div>
+                    <span className="text-[11px] font-serif font-bold text-[#5A5A40]">{Math.floor(entry.duration / 60)}m</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        )}
 
         {showSoundSettings && (
           <motion.div 
@@ -1313,7 +1448,6 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
       const newCards = flashcards.filter(c => c.confidence === 0).map(c => c.front).slice(0, 5);
       const quizHistory = sessions.filter(s => s.type === 'quiz').slice(0, 5).map(s => `Score: ${s.data?.score}/${s.data?.total}`).join(', ');
       
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const prompt = `Act as an Educational Strategist. Based on this student's data, suggest 5 diverse quiz topics that would bridge their knowledge gaps or reinforce recent learning.
       - Low Confidence Topics: ${lowConfidenceCards.join(', ') || 'None'}
       - New Topics: ${newCards.join(', ') || 'None'}
@@ -1328,7 +1462,12 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
       
       Return 5 specific topic strings in a JSON array: ["Topic 1", "Topic 2", "Topic 3", "Topic 4", "Topic 5"]`;
 
-      const data = await callGemini(prompt);
+      const schema = {
+        type: 'array',
+        items: { type: 'string' }
+      };
+
+      const data = await callGemini(prompt, 'gemini-3-flash-preview', true, undefined, schema);
       setSuggestions(data);
     } catch (error) {
       console.error('Failed to get suggestions:', error);
@@ -1341,7 +1480,6 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
     if (!topic.trim()) return;
     setStep('generating');
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const prompt = `Generate a quiz about "${topic}" with difficulty level "${difficulty}".
       The response MUST be a JSON object strictly following this structure:
       {
@@ -1367,7 +1505,31 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
       }
       Provide exactly 5 high-quality questions. Ensure correct JSON syntax.`;
 
-      const data = await callGemini(prompt);
+      const schema = {
+        type: 'object',
+        properties: {
+          topic: { type: 'string' },
+          difficulty: { type: 'string' },
+          questions: {
+            type: 'array',
+            items: {
+              type: 'object',
+              properties: {
+                id: { type: 'string' },
+                type: { type: 'string', enum: ['multiple-choice', 'true-false'] },
+                question: { type: 'string' },
+                options: { type: 'array', items: { type: 'string' } },
+                answer: { type: 'string' },
+                explanation: { type: 'string' }
+              },
+              required: ['id', 'type', 'question', 'answer', 'explanation']
+            }
+          }
+        },
+        required: ['topic', 'difficulty', 'questions']
+      };
+
+      const data = await callGemini(prompt, 'gemini-3-flash-preview', true, undefined, schema);
       setQuiz(data);
       setStep('active');
     } catch (error) {
@@ -1385,7 +1547,6 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
         isCorrect: userAnswers[i] === q.answer
       }));
 
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const prompt = `Based on the student's performance on this quiz about "${currentQuiz.topic}", generate 3-5 thought-provoking follow-up questions or discussion points to deepen their conceptual understanding.
       These must be DIFFERENT from the original quiz questions and specifically target areas where they might need more clarity or curiosity.
       
@@ -1393,7 +1554,12 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
       
       Return as a JSON array of strings: ["question 1", "question 2", ...]`;
 
-      const data = await callGemini(prompt);
+      const schema = {
+        type: 'array',
+        items: { type: 'string' }
+      };
+
+      const data = await callGemini(prompt, 'gemini-3-flash-preview', true, undefined, schema);
       setFollowUpQuestions(data);
     } catch (error) {
       console.error('Failed to generate follow-up questions:', error);
@@ -1688,7 +1854,7 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
   return null;
 };
 
-const AboutView = () => {
+const AboutView = ({ user }: { user: UserProfile | null }) => {
   const features = [
     { title: 'AI Personalized Tutoring', icon: <Cpu className="w-5 h-5" />, desc: 'A custom-trained tutor that understands your academic profile and learning style.' },
     { title: 'Weekly Strategic Planning', icon: <Calendar className="w-5 h-5" />, desc: 'AI-synthesized weekly schedules that adapt to your quiz performance and mastery.' },
@@ -1737,8 +1903,16 @@ const AboutView = () => {
         <div className="pt-6 relative z-10">
           <p className="text-[9px] sm:text-[10px] font-black uppercase tracking-[0.4em] text-white/40">Built with Precision by</p>
           <div className="mt-4 inline-flex items-center gap-3 sm:gap-4 bg-white/10 px-6 sm:px-8 py-3 rounded-full backdrop-blur-sm border border-white/10">
-            <div className="w-6 h-6 sm:w-8 sm:h-8 bg-white rounded-full flex items-center justify-center font-serif italic text-[#5A5A40] font-black text-xs sm:text-sm">S</div>
-            <span className="text-base sm:text-lg font-bold tracking-tight">Shrushti</span>
+            {user ? (
+              <>
+                <div className="w-6 h-6 sm:w-8 sm:h-8 bg-white rounded-full flex items-center justify-center font-serif italic text-[#5A5A40] font-black text-xs sm:text-sm">
+                  {user.username.charAt(0).toUpperCase()}
+                </div>
+                <span className="text-base sm:text-lg font-bold tracking-tight">{user.username}</span>
+              </>
+            ) : (
+              <span className="text-base sm:text-lg font-bold tracking-tight">AI Study Buddy</span>
+            )}
           </div>
         </div>
       </div>
@@ -1781,7 +1955,7 @@ const WeeklyPlanView = ({
         ? Math.round(sessions.reduce((acc, s) => acc + s.duration, 0) / sessions.length / 60)
         : 0;
 
-      const prompt = `As an elite AI study strategist, generate a highly personalized 7-day study plan for ${user.username}.
+      const aiPrompt = `As an elite AI study strategist, generate a highly personalized 7-day study plan for ${user.username}.
       
       User Profile & Context:
       - Primary Subjects: ${user.academicProfile?.subjects.join(', ') || 'General Studies'}
@@ -1808,9 +1982,22 @@ const WeeklyPlanView = ({
         ...
       ]`;
 
-      const data = await callGemini(prompt);
+      const schema = {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            day: { type: 'string' },
+            goals: { type: 'array', items: { type: 'string' } },
+            focus: { type: 'string' }
+          },
+          required: ['day', 'goals']
+        }
+      };
+
+      const data = await callGemini(aiPrompt, 'gemini-3-flash-preview', true, undefined, schema);
       setStudyPlan(data);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to generate study plan:', error);
     } finally {
       setIsGeneratingPlan(false);
@@ -1915,7 +2102,11 @@ const DashboardView = ({
   flashcards,
   studyPlan,
   setStudyPlan,
-  onNavigate
+  onNavigate,
+  recommendations,
+  setRecommendations,
+  isGeneratingRecs,
+  setIsGeneratingRecs
 }: { 
   user: UserProfile,
   stats: any[], 
@@ -1923,11 +2114,13 @@ const DashboardView = ({
   flashcards: Flashcard[],
   studyPlan: { day: string, goals: string[], focus?: string }[] | null,
   setStudyPlan: (plan: { day: string, goals: string[], focus?: string }[] | null) => void,
-  onNavigate: (view: View) => void
+  onNavigate: (view: View) => void,
+  recommendations: { title: string, content: string, type: 'topic' | 'technique', priority: 'high' | 'medium' }[],
+  setRecommendations: (recs: any) => void,
+  isGeneratingRecs: boolean,
+  setIsGeneratingRecs: (v: boolean) => void
 }) => {
   const [isGeneratingPlan, setIsGeneratingPlan] = useState(false);
-  const [recommendations, setRecommendations] = useState<{ title: string, content: string, type: 'topic' | 'technique', priority: 'high' | 'medium' }[]>([]);
-  const [isGeneratingRecs, setIsGeneratingRecs] = useState(false);
 
   const greeting = useMemo(() => {
     const hour = new Date().getHours();
@@ -1950,8 +2143,6 @@ const DashboardView = ({
   const generateWeeklyPlan = async () => {
     setIsGeneratingPlan(true);
     try {
-      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-      
       const quizPerformance = sessions
         .filter(s => s.type === 'quiz' && s.data)
         .map(s => ({ topic: s.data.topic, score: s.data.score, total: s.data.total }));
@@ -1960,7 +2151,7 @@ const DashboardView = ({
         ? Math.round(sessions.reduce((acc, s) => acc + s.duration, 0) / sessions.length / 60)
         : 0;
 
-      const prompt = `As an elite AI study strategist, generate a highly personalized 7-day study plan for ${user.username}.
+      const aiPrompt = `As an elite AI study strategist, generate a highly personalized 7-day study plan for ${user.username}.
       
       User Profile & Context:
       - Primary Subjects: ${user.academicProfile?.subjects.join(', ') || 'General Studies'}
@@ -1987,29 +2178,64 @@ const DashboardView = ({
         ...
       ]`;
 
-      const data = await callGemini(prompt);
+      const schema = {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            day: { type: 'string' },
+            goals: { type: 'array', items: { type: 'string' } },
+            focus: { type: 'string' }
+          },
+          required: ['day', 'goals']
+        }
+      };
+
+      const data = await callGemini(aiPrompt, 'gemini-3-flash-preview', true, undefined, schema);
       setStudyPlan(data);
-    } catch (error) {
+    } catch (error: any) {
       console.error('Failed to generate study plan:', error);
     } finally {
       setIsGeneratingPlan(false);
     }
   };
 
+  const [errorRecs, setErrorRecs] = useState<string | null>(null);
+
   const generateRecommendations = async () => {
     if (isGeneratingRecs) return;
     setIsGeneratingRecs(true);
+    setErrorRecs(null);
     try {
       const quizPerformance = sessions
         .filter(s => s.type === 'quiz' && s.data)
         .map(s => ({ topic: s.data.topic, score: s.data.score, total: s.data.total }));
 
-      const prompt = `Based on the following data for ${user.username}, provide 3 highly specific study recommendations.\n      \n      Context:\n      - Mastery: ${JSON.stringify(masteryData.map(m => ({ label: m.name, count: m.value })))}\n      - Quiz Performance (Recent): ${JSON.stringify(quizPerformance.slice(0, 3))}\n      - Subjects: ${user.academicProfile?.subjects.join(', ')}\n      - Strategy: ${user.academicProfile?.studyStrategy}\n\n      Recommendations should be split between 'topic' (what to study) and 'technique' (how to study).\n      \n      Return format (strict JSON array):\n      [ \n        { \"title\": \"...\", \"content\": \"...\", \"type\": \"topic\" | \"technique\", \"priority\": \"high\" | \"medium\" }\n      ]`;
+      const aiPrompt = `Based on the following data for ${user.username}, provide 3 highly specific study recommendations.\n      \n      Context:\n      - Mastery: ${JSON.stringify(masteryData.map(m => ({ label: m.name, count: m.value })))}\n      - Quiz Performance (Recent): ${JSON.stringify(quizPerformance.slice(0, 3))}\n      - Subjects: ${user.academicProfile?.subjects.join(', ')}\n      - Strategy: ${user.academicProfile?.studyStrategy}\n\n      Recommendations should be split between 'topic' (what to study) and 'technique' (how to study).\n      \n      Return format (strict JSON array):\n      [ \n        { \"title\": \"...\", \"content\": \"...\", \"type\": \"topic\" | \"technique\", \"priority\": \"high\" | \"medium\" }\n      ]`;
 
-      const data = await callGemini(prompt);
-      setRecommendations(data);
-    } catch (error) {
+      const schema = {
+        type: 'array',
+        items: {
+          type: 'object',
+          properties: {
+            title: { type: 'string' },
+            content: { type: 'string' },
+            type: { type: 'string', enum: ['topic', 'technique'] },
+            priority: { type: 'string', enum: ['high', 'medium'] }
+          },
+          required: ['title', 'content', 'type', 'priority']
+        }
+      };
+
+      const data = await callGemini(aiPrompt, 'gemini-3-flash-preview', true, undefined, schema);
+      if (Array.isArray(data)) {
+        setRecommendations(data);
+      } else {
+        throw new Error("Invalid response format for recommendations");
+      }
+    } catch (error: any) {
       console.error('Rec generation failed:', error);
+      setErrorRecs(error.message || "Failed to generate recommendations. Please try again.");
     } finally {
       setIsGeneratingRecs(false);
     }
@@ -2215,6 +2441,12 @@ const DashboardView = ({
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 sm:gap-6">
+          {errorRecs && (
+            <div className="md:col-span-2 lg:col-span-3 p-6 bg-red-50 border border-red-100 rounded-3xl text-red-600 text-sm font-medium flex items-center gap-3">
+              <HelpCircle className="w-5 h-5" />
+              {errorRecs}
+            </div>
+          )}
           {isGeneratingRecs && recommendations.length === 0 ? (
             Array.from({ length: 3 }).map((_, i) => (
               <div key={i} className="h-40 sm:h-48 bg-white rounded-[32px] sm:rounded-[40px] border border-[#D9D9C3] animate-pulse" />
@@ -2976,15 +3208,45 @@ export default function App() {
           setCurrentUser(updatedUser);
           setActiveView('dashboard');
         }} /> : <AuthView onLogin={handleLogin} />;
-      case 'dashboard': return currentUser ? <DashboardView user={currentUser} stats={dashboardStats} sessions={sessions} flashcards={flashcards} studyPlan={studyPlan} setStudyPlan={setStudyPlan} onNavigate={setActiveView} /> : null;
-      case 'weekly': return currentUser ? <WeeklyPlanView user={currentUser} sessions={sessions} flashcards={flashcards} studyPlan={studyPlan} setStudyPlan={setStudyPlan} /> : null;
-      case 'about': return <AboutView />;
+      case 'dashboard': return currentUser ? <DashboardView 
+        user={currentUser} 
+        stats={dashboardStats} 
+        sessions={sessions} 
+        flashcards={flashcards} 
+        studyPlan={studyPlan} 
+        setStudyPlan={setStudyPlan} 
+        onNavigate={setActiveView}
+        recommendations={recommendations}
+        setRecommendations={setRecommendations}
+        isGeneratingRecs={isGeneratingRecs}
+        setIsGeneratingRecs={setIsGeneratingRecs}
+      /> : null;
+      case 'weekly': return currentUser ? <WeeklyPlanView 
+        user={currentUser} 
+        sessions={sessions} 
+        flashcards={flashcards} 
+        studyPlan={studyPlan} 
+        setStudyPlan={setStudyPlan} 
+      /> : null;
+      case 'about': return <AboutView user={currentUser} />;
       case 'tutor': return <AITutor user={currentUser!} />;
       case 'flashcards': return <FlashcardsView cards={flashcards} setCards={setFlashcards} onReviewComplete={(count) => logSession('flashcards', 300, { count })} />;
       case 'timer': return <StudyTimer onSessionComplete={(duration) => logSession('timer', duration)} />;
       case 'quizzes': return <QuizView sessions={sessions} flashcards={flashcards} onComplete={(score, total, topic) => logSession('quiz', 600, { score, total, topic })} onNavigate={setActiveView} />;
       case 'profile': return currentUser ? <ProfileView user={currentUser} onUpdate={setCurrentUser} onLogout={() => { setCurrentUser(null); setActiveView('auth'); }} /> : <AuthView onLogin={handleLogin} />;
-      default: return currentUser ? <DashboardView user={currentUser} stats={dashboardStats} sessions={sessions} flashcards={flashcards} studyPlan={studyPlan} setStudyPlan={setStudyPlan} onNavigate={setActiveView} /> : null;
+      default: return currentUser ? <DashboardView 
+        user={currentUser} 
+        stats={dashboardStats} 
+        sessions={sessions} 
+        flashcards={flashcards} 
+        studyPlan={studyPlan} 
+        setStudyPlan={setStudyPlan} 
+        onNavigate={setActiveView}
+        recommendations={recommendations}
+        setRecommendations={setRecommendations}
+        isGeneratingRecs={isGeneratingRecs}
+        setIsGeneratingRecs={setIsGeneratingRecs}
+      /> : null;
     }
   };
 
@@ -3116,7 +3378,7 @@ export default function App() {
           
           <div className="px-8 pb-8 pt-2 mt-auto border-t border-[#D9D9C3]/30">
             <p className="text-[10px] font-black text-[#8C8C73] uppercase tracking-[0.3em] text-center opacity-60">
-              Made by <span className="text-[#BC6C25]">Shrushti</span>
+              Made with <span className="text-red-500">♥</span> for Curiosity
             </p>
           </div>
         </div>
