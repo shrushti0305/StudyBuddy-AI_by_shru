@@ -1,0 +1,6 @@
+{
+  "name": "StudyBuddy AI",
+  "description": "Your intelligent learning companion. Generate quizzes, manage flashcards, and chat with an AI tutor to master any subject.",
+  "requestFramePermissions": ["notifications"],
+  "majorCapabilities": []
+}
