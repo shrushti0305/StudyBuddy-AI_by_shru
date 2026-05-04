@@ -40,7 +40,6 @@ import {
   Flame
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { GoogleGenAI } from "@google/genai";
 import Markdown from 'react-markdown';
 import { 
   LineChart, 
@@ -92,31 +91,27 @@ const setStorage = <T,>(key: string, value: T) => {
   localStorage.setItem(key, JSON.stringify(value));
 };
 
-const callGemini = async (contents: string | any[], modelId: string = "gemini-3-flash-preview", isJson: boolean = true, systemInstruction?: string, responseSchema?: any) => {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
-    const err = 'GEMINI_API_KEY is missing from environment. Please set it in Settings -> Secrets.';
-    console.error(err);
-    throw new Error(err);
-  }
-  
+const callGemini = async (contents: string | any[], modelId: string = "gemini-2.0-flash", isJson: boolean = true, systemInstruction?: string, responseSchema?: any): Promise<any> => {
   try {
-    const ai = new GoogleGenAI({ apiKey });
-    const response = await ai.models.generateContent({
-      model: modelId,
-      contents: Array.isArray(contents) ? contents : contents,
-      config: {
-        ...(isJson ? { responseMimeType: "application/json" } : {}),
-        ...(responseSchema ? { responseSchema } : {}),
-        ...(systemInstruction ? { systemInstruction } : {})
-      }
+    const response = await fetch('/api/ai', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contents, modelId, isJson, systemInstruction, responseSchema })
     });
-    
-    const text = response.text || '';
-    if (!text) {
-      throw new Error('Empty response from AI model');
+
+    if (response.status === 401) {
+      const errorData = await response.json();
+      throw new Error(`API_KEY_ERROR: ${errorData.details || 'Invalid API Key'}`);
     }
-    
+
+    if (!response.ok) {
+      const errorData = await response.json();
+      throw new Error(errorData.error || `HTTP error! status: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const text = data.text;
+
     if (isJson) {
       try {
         const cleaned = text.replace(/```json/g, '').replace(/```/g, '').trim();
@@ -136,13 +131,14 @@ const callGemini = async (contents: string | any[], modelId: string = "gemini-3-
     }
     return text;
   } catch (error: any) {
-    console.error("Gemini API Error Detail:", error);
-    // Extract a user-friendly message from Google API error
+    console.error("AI Proxy Error:", error);
     let message = error.message || "An unexpected AI error occurred.";
-    if (message.includes("quota") || message.includes("429")) {
-      message = "AI Limit Reached: Please wait a minute before trying again (Google Free Tier Quota).";
-    } else if (message.includes("API key")) {
-      message = "Invalid API Key: Please check your GEMINI_API_KEY in Settings.";
+    if (message.includes("quota") || message.includes("429") || message.toLowerCase().includes("ai quota exceeded")) {
+      message = "AI Quota Exceeded: The free tier limit has been reached. Please wait about 60 seconds, or use your own API key in Settings -> Secrets (USER_GEMINI_API_KEY).";
+    } else if (message.includes("Forbidden") || message.includes("403") || message.toLowerCase().includes("ai access forbidden")) {
+      message = "AI Access Restricted: This request was forbidden. This usually happens if the service is unavailable in your region or if your API key lacks permissions. Try a different key in Settings -> Secrets.";
+    } else if (message.includes("GEMINI_API_KEY") || message.includes("API_KEY_ERROR") || message.toLowerCase().includes("invalid api key")) {
+      message = "AI Configuration Error: Your API key is missing or invalid. Please add a secret named 'USER_GEMINI_API_KEY' in Settings -> Secrets with a valid key from aistudio.google.com.";
     }
     throw new Error(message);
   }
@@ -240,7 +236,12 @@ const AuthView = ({ onLogin }: { onLogin: (user: UserProfile) => void }) => {
       if (err.code === 'auth/popup-blocked') {
         errorMessage = "Sign-in popup was blocked. Please allow popups for this site.";
       } else if (err.code === 'auth/unauthorized-domain') {
-        errorMessage = "This domain is not authorized for Google Sign-in in the Firebase Console. Please add it to Authorized Domains.";
+        const domain = window.location.hostname;
+        errorMessage = `Domain "${domain}" is not authorized for Google Sign-in. Please add it to your Firebase Console -> Authentication -> Settings -> Authorized Domains.`;
+      } else if (err.code === 'auth/cancelled-popup-request') {
+        errorMessage = "A previous login attempt is still pending. Please wait or refresh the page.";
+      } else if (err.code === 'auth/popup-closed-by-user') {
+        errorMessage = "The login popup was closed before completion. Please try again.";
       }
       setError(errorMessage);
     }
@@ -502,13 +503,16 @@ const AITutor = ({ user }: { user: UserProfile }) => {
   ]);
   const [input, setInput] = useState('');
   const [isLoading, setIsLoading] = useState(false);
-  const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
   const scrollRef = useRef<HTMLDivElement>(null);
-
   const models = [
-    { id: 'gemini-3-flash-preview', label: 'Flash 3.0' },
-    { id: 'gemini-3.1-pro-preview', label: 'Pro 3.1' }
+    { id: 'gemini-3-flash-preview', label: 'Gemini 3 Flash' },
+    { id: 'gemini-flash-latest', label: 'Gemini Flash' },
+    { id: 'gemini-3.1-pro-preview', label: 'Gemini 3.1 Pro' },
+    { id: 'gemini-3.1-flash-lite-preview', label: 'Gemini 3.1 Lite' },
+    { id: 'gemini-2.0-flash', label: 'Gemini 2.0 Flash' }
   ];
+  
+  const [selectedModel, setSelectedModel] = useState('gemini-3-flash-preview');
 
   useEffect(() => {
     if (scrollRef.current) {
@@ -582,9 +586,13 @@ const AITutor = ({ user }: { user: UserProfile }) => {
       setMessages(prev => [...prev, botMessage]);
     } catch (error: any) {
       console.error("AI Tutor Error:", error);
-      const errorMessage = error.message?.includes('API key') 
-        ? "The AI service is currently unavailable. Please verify the environment configuration."
-        : "I'm having a bit of trouble connecting to my brain right now. Can we try again in a moment?";
+      let errorMessage = "I'm having a bit of trouble connecting to my brain right now. Can we try again in a moment?";
+      
+      if (error.message?.includes('API_KEY_ERROR')) {
+        errorMessage = "Security Error: Your API key is invalid or restricted. Please go to Settings -> Secrets and add a NEW secret named USER_GEMINI_API_KEY with a fresh key from aistudio.google.com/app/apikey";
+      } else if (error.message?.includes('AI Proxy Error')) {
+        errorMessage = "Connection Error: Failed to reach the AI engine. Check your internet or try again later.";
+      }
         
       setMessages(prev => [...prev, { 
         role: 'bot', 
@@ -714,7 +722,7 @@ interface SessionHistoryEntry {
   timestamp: number;
 }
 
-const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: number) => void }) => {
+const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: number, type: 'work' | 'break') => void }) => {
   const [settings, setSettings] = useState<TimerSettings>({
     work: 25,
     shortBreak: 5,
@@ -805,18 +813,23 @@ const StudyTimer = ({ onSessionComplete }: { onSessionComplete: (duration: numbe
     setIsActive(false);
     if (timerRef.current) clearInterval(timerRef.current);
     
+    const sessionType = mode === 'work' ? 'work' : 'break';
+    const sessionDuration = settings[mode] * 60;
+
     // Add to history
     const historyEntry: SessionHistoryEntry = {
-      type: mode === 'work' ? 'work' : 'break',
-      duration: settings[mode] * 60,
+      type: sessionType,
+      duration: sessionDuration,
       timestamp: Date.now()
     };
     setSessionHistory(prev => [historyEntry, ...prev].slice(0, 50)); // Keep last 50 entries
 
+    // Call global log for both work and break
+    onSessionComplete(sessionDuration, sessionType);
+
     if (mode === 'work') {
       const newCount = sessionsCompleted + 1;
       setSessionsCompleted(newCount);
-      onSessionComplete(settings.work * 60); // Log session
       if (newCount % 4 === 0) {
         setMode('longBreak');
         setTimeLeft(settings.longBreak * 60);
@@ -1532,9 +1545,13 @@ const QuizView = ({ sessions, flashcards, onComplete, onNavigate }: {
       const data = await callGemini(prompt, 'gemini-3-flash-preview', true, undefined, schema);
       setQuiz(data);
       setStep('active');
-    } catch (error) {
+    } catch (error: any) {
       console.error(error);
-      alert("Failed to generate quiz. Please try a different topic.");
+      let msg = "Failed to generate quiz. Please try a different topic.";
+      if (error.message?.includes('API_KEY_ERROR')) {
+        msg = "Critical error identifying your API Key. Please add USER_GEMINI_API_KEY in your project Secrets.";
+      }
+      alert(msg);
       setStep('config');
     }
   };
@@ -1999,6 +2016,9 @@ const WeeklyPlanView = ({
       setStudyPlan(data);
     } catch (error: any) {
       console.error('Failed to generate study plan:', error);
+      if (error.message?.includes('API_KEY_ERROR')) {
+        alert("Strategy synthesis (Weekly) failed: Invalid API Key. Please update your settings in AI Studio.");
+      }
     } finally {
       setIsGeneratingPlan(false);
     }
@@ -2195,6 +2215,9 @@ const DashboardView = ({
       setStudyPlan(data);
     } catch (error: any) {
       console.error('Failed to generate study plan:', error);
+      if (error.message?.includes('API_KEY_ERROR')) {
+        alert("Strategy synthesis (Dashboard) failed: API Key issue detected.");
+      }
     } finally {
       setIsGeneratingPlan(false);
     }
@@ -2235,7 +2258,7 @@ const DashboardView = ({
       }
     } catch (error: any) {
       console.error('Rec generation failed:', error);
-      setErrorRecs(error.message || "Failed to generate recommendations. Please try again.");
+      setErrorRecs(error.message?.includes('API_KEY_ERROR') ? "Security Error: Your API key is invalid or missing. Check AI Studio settings." : (error.message || "Failed to generate recommendations. Please try again."));
     } finally {
       setIsGeneratingRecs(false);
     }
@@ -3050,6 +3073,20 @@ export default function App() {
           const userDoc = await getDoc(doc(db, 'users', currentUser.uid));
           if (userDoc.exists()) {
             const cloudData = userDoc.data();
+            
+            // Sync user profile fields if they exist in cloud
+            if (cloudData.username || cloudData.academicProfile) {
+              setCurrentUser(prev => {
+                if (!prev) return prev;
+                return {
+                  ...prev,
+                  username: cloudData.username || prev.username,
+                  avatar: cloudData.avatar || prev.avatar,
+                  academicProfile: cloudData.academicProfile || prev.academicProfile
+                };
+              });
+            }
+
             if (cloudData.flashcards) setFlashcards(cloudData.flashcards);
             if (cloudData.sessions) setSessions(cloudData.sessions);
             if (cloudData.studyPlan) setStudyPlan(cloudData.studyPlan);
@@ -3083,6 +3120,8 @@ export default function App() {
       setActiveView('auth');
     } else if (currentUser && activeView === 'auth') {
       setActiveView('dashboard');
+    } else if (currentUser?.academicProfile && activeView === 'onboarding') {
+      setActiveView('dashboard');
     }
   }, [currentUser, activeView]);
 
@@ -3094,6 +3133,9 @@ export default function App() {
         // Save to Firestore if connected
         if (currentUser?.uid) {
           await setDoc(doc(db, 'users', currentUser.uid), {
+            username: currentUser.username,
+            avatar: currentUser.avatar,
+            academicProfile: currentUser.academicProfile,
             flashcards,
             sessions,
             studyPlan,
@@ -3200,6 +3242,23 @@ export default function App() {
     }
   };
 
+  const handleLogout = () => {
+    setCurrentUser(null);
+    setFlashcards([
+      { id: '1', front: 'Mitochondria', back: 'The powerhouse of the cell', confidence: 0 },
+      { id: '2', front: 'Osmosis', back: 'Spontaneous net movement of solvent molecules through a selectively permeable membrane', confidence: 0 }
+    ]);
+    setSessions([]);
+    setStudyPlan(null);
+    setDailyFocus('');
+    setActiveView('auth');
+    localStorage.removeItem(STORAGE_KEYS.USER);
+    localStorage.removeItem(STORAGE_KEYS.CARDS);
+    localStorage.removeItem(STORAGE_KEYS.SESSIONS);
+    localStorage.removeItem(STORAGE_KEYS.PLAN);
+    localStorage.removeItem('studybuddy_daily_focus');
+  };
+
   const renderView = () => {
     switch (activeView) {
       case 'auth': return <AuthView onLogin={handleLogin} />;
@@ -3231,9 +3290,9 @@ export default function App() {
       case 'about': return <AboutView user={currentUser} />;
       case 'tutor': return <AITutor user={currentUser!} />;
       case 'flashcards': return <FlashcardsView cards={flashcards} setCards={setFlashcards} onReviewComplete={(count) => logSession('flashcards', 300, { count })} />;
-      case 'timer': return <StudyTimer onSessionComplete={(duration) => logSession('timer', duration)} />;
+      case 'timer': return <StudyTimer onSessionComplete={(duration, type) => logSession('timer', duration, { subtype: type })} />;
       case 'quizzes': return <QuizView sessions={sessions} flashcards={flashcards} onComplete={(score, total, topic) => logSession('quiz', 600, { score, total, topic })} onNavigate={setActiveView} />;
-      case 'profile': return currentUser ? <ProfileView user={currentUser} onUpdate={setCurrentUser} onLogout={() => { setCurrentUser(null); setActiveView('auth'); }} /> : <AuthView onLogin={handleLogin} />;
+      case 'profile': return currentUser ? <ProfileView user={currentUser} onUpdate={setCurrentUser} onLogout={handleLogout} /> : <AuthView onLogin={handleLogin} />;
       default: return currentUser ? <DashboardView 
         user={currentUser} 
         stats={dashboardStats} 
